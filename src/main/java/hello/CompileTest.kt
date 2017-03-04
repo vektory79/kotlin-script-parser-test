@@ -2,34 +2,60 @@ package hello
 
 import com.intellij.openapi.util.Disposer
 import com.intellij.psi.search.GlobalSearchScope
+import org.jetbrains.kotlin.analyzer.ModuleContent
+import org.jetbrains.kotlin.analyzer.ModuleInfo
+import org.jetbrains.kotlin.analyzer.PlatformAnalysisParameters
+import org.jetbrains.kotlin.analyzer.common.DefaultAnalyzerFacade
 import org.jetbrains.kotlin.cli.common.CLIConfigurationKeys
-import org.jetbrains.kotlin.cli.common.messages.*
-import org.jetbrains.kotlin.cli.jvm.compiler.*
-import org.jetbrains.kotlin.cli.jvm.config.JVMConfigurationKeys
+import org.jetbrains.kotlin.cli.common.messages.CompilerMessageLocation
+import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
+import org.jetbrains.kotlin.cli.common.messages.GroupingMessageCollector
+import org.jetbrains.kotlin.cli.common.messages.MessageCollector
+import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
+import org.jetbrains.kotlin.cli.jvm.compiler.JvmPackagePartProvider
+import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.cli.jvm.config.addJvmClasspathRoots
-import org.jetbrains.kotlin.cli.jvm.config.getModuleName
 import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.config.addKotlinSourceRoot
-import org.jetbrains.kotlin.descriptors.PackageFragmentProvider
-import org.jetbrains.kotlin.frontend.java.di.createContainerForTopDownAnalyzerForJvm
-import org.jetbrains.kotlin.incremental.components.LookupTracker
+import org.jetbrains.kotlin.container.get
+import org.jetbrains.kotlin.context.ProjectContext
+import org.jetbrains.kotlin.descriptors.ModuleDescriptor
 import org.jetbrains.kotlin.load.java.JvmAbi
+import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.KtBlockExpression
-import org.jetbrains.kotlin.resolve.AnalyzerScriptParameter
+import org.jetbrains.kotlin.resolve.LazyTopDownAnalyzer
+import org.jetbrains.kotlin.resolve.MultiTargetPlatform
 import org.jetbrains.kotlin.resolve.TopDownAnalysisContext
 import org.jetbrains.kotlin.resolve.TopDownAnalysisMode
-import org.jetbrains.kotlin.resolve.jvm.JvmAnalyzerFacade
-import org.jetbrains.kotlin.resolve.jvm.TopDownAnalyzerFacadeForJVM
-import org.jetbrains.kotlin.resolve.lazy.declarations.FileBasedDeclarationProviderFactory
 import org.jetbrains.kotlin.utils.PathUtil
 import java.io.File
 import java.util.*
 import java.util.logging.Logger
 
 class KotlinScriptParser {
+    private class SourceModuleInfo(
+            override val name: Name,
+            override val capabilities: Map<ModuleDescriptor.Capability<*>, Any?>,
+            private val dependOnOldBuiltIns: Boolean
+    ) : ModuleInfo {
+        override fun dependencies() = listOf(this)
+
+        override fun dependencyOnBuiltIns(): ModuleInfo.DependencyOnBuiltIns =
+                if (dependOnOldBuiltIns) ModuleInfo.DependenciesOnBuiltIns.LAST else ModuleInfo.DependenciesOnBuiltIns.NONE
+    }
+
     companion object {
-        private val LOG = Logger.getLogger(KotlinScriptParser.javaClass.name)
+        private val LOG = Logger.getLogger(KotlinScriptParser::class.java.name)
         private val messageCollector = object : MessageCollector {
+            private var hasErrors = false
+            override fun clear() {
+                hasErrors = false
+            }
+
+            override fun hasErrors(): Boolean {
+                return hasErrors
+            }
+
             override fun report(severity: CompilerMessageSeverity, message: String, location: CompilerMessageLocation) {
                 val path = location.path
                 val position = if (path == null) "" else "$path: (${location.line}, ${location.column}) "
@@ -40,6 +66,7 @@ class KotlinScriptParser {
                     LOG.finest(text)
                 } else if (CompilerMessageSeverity.ERRORS.contains(severity)) {
                     LOG.severe(text)
+                    hasErrors = true
                 } else if (severity == CompilerMessageSeverity.INFO) {
                     LOG.info(text)
                 } else {
@@ -60,7 +87,7 @@ class KotlinScriptParser {
         val configuration = CompilerConfiguration()
 
         val groupingCollector = GroupingMessageCollector(messageCollector)
-        val severityCollector = MessageSeverityCollector(groupingCollector)
+        val severityCollector = GroupingMessageCollector(groupingCollector)
         configuration.put(CLIConfigurationKeys.MESSAGE_COLLECTOR_KEY, severityCollector)
 
 
@@ -69,38 +96,33 @@ class KotlinScriptParser {
         files.forEach { configuration.addKotlinSourceRoot(it) }
         // Configuring Kotlin class path
         configuration.addJvmClasspathRoots(classPath)
-        configuration.put(JVMConfigurationKeys.MODULE_NAME, JvmAbi.DEFAULT_MODULE_NAME)
-        configuration.put<List<AnalyzerScriptParameter>>(JVMConfigurationKeys.SCRIPT_PARAMETERS, CommandLineScriptUtils.scriptParameters())
 
         val rootDisposable = Disposer.newDisposable()
         try {
             val environment = KotlinCoreEnvironment.createForProduction(rootDisposable, configuration, EnvironmentConfigFiles.JVM_CONFIG_FILES)
             val ktFiles = environment.getSourceFiles()
-            val sharedTrace = CliLightClassGenerationSupport.NoScopeRecordCliBindingTrace()
-            val moduleContext = TopDownAnalyzerFacadeForJVM.createContextWithSealedModule(environment.project,
-                    environment.getModuleName())
 
-            val project = moduleContext.project
-            val allFiles = JvmAnalyzerFacade.getAllFilesToAnalyze(project, null, ktFiles)
-            val providerFactory = FileBasedDeclarationProviderFactory(moduleContext.storageManager, allFiles)
-            val lookupTracker = LookupTracker.DO_NOTHING
-            val packagePartProvider = JvmPackagePartProvider(environment)
-            val container = createContainerForTopDownAnalyzerForJvm(
-                    moduleContext,
-                    sharedTrace,
-                    providerFactory,
-                    GlobalSearchScope.allScope(project),
-                    lookupTracker,
-                    packagePartProvider)
+            val capabilities: Map<ModuleDescriptor.Capability<*>, Any?> = mapOf(MultiTargetPlatform.CAPABILITY to MultiTargetPlatform.Common)
 
-            val additionalProviders = ArrayList<PackageFragmentProvider>()
+            val moduleInfo = SourceModuleInfo(Name.special("<${JvmAbi.DEFAULT_MODULE_NAME}"), capabilities, false)
+            val project = ktFiles.firstOrNull()?.project ?: throw AssertionError("No files to analyze")
+            val resolver = DefaultAnalyzerFacade.setupResolverForProject(
+                    "sources for metadata serializer",
+                    ProjectContext(project), listOf(moduleInfo),
+                    { ModuleContent(ktFiles, GlobalSearchScope.allScope(project)) },
+                    object : PlatformAnalysisParameters {},
+                    packagePartProviderFactory = {
+                        _, content -> JvmPackagePartProvider(environment, content.moduleContentScope)
+                    },
+                    modulePlatforms = { MultiTargetPlatform.Common }
+            )
 
-            additionalProviders.add(container.javaDescriptorResolver.packageFragmentProvider)
+            val container = resolver.resolverForModule(moduleInfo).componentProvider
 
-            return container.lazyTopDownAnalyzerForTopLevel.analyzeFiles(TopDownAnalysisMode.LocalDeclarations, allFiles, additionalProviders)
+            return container.get<LazyTopDownAnalyzer>().analyzeDeclarations(TopDownAnalysisMode.TopLevelDeclarations, ktFiles)
         } finally {
             rootDisposable.dispose()
-            if (severityCollector.anyReported(CompilerMessageSeverity.ERROR)) {
+            if (severityCollector.hasErrors()) {
                 throw RuntimeException("Compilation error")
             }
         }
