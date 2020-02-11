@@ -65,10 +65,13 @@ class KotlinScriptParser {
             }
 
             override fun report(severity: CompilerMessageSeverity, message: String, location: CompilerMessageLocation?) {
-                val path = location!!.path
-                val position = "$path: (${location.line}, ${location.column}) "
-
-                val text = position + message
+                val text = if (location != null) {
+                    val path = location.path
+                    val position = "$path: (${location.line}, ${location.column}) "
+                    position + message
+                } else {
+                    message
+                }
 
                 when {
                     CompilerMessageSeverity.VERBOSE.contains(severity) -> {
